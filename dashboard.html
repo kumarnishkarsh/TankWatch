@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TankWatch</title>
+<style>
+:root{--bg:#0b1220;--card:#131c2e;--tx:#e8eefc;--mut:#9fb0cf;--ok:#22c55e;--warn:#f59e0b;--crit:#ef4444;--info:#38bdf8}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:22px/1.3 system-ui,"Segoe UI",Arial,sans-serif}
+header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 24px}
+h1{margin:0;font-size:40px}
+h2{margin:0 0 8px;font-size:24px;color:var(--mut);font-weight:600}
+.chips{display:flex;gap:10px;flex-wrap:wrap}
+.chip{padding:8px 18px;border-radius:999px;font-weight:700;background:#24314d}
+.chip.ok{background:#14532d}.chip.bad{background:#7f1d1d}.chip.warn{background:#78350f}
+#note{display:none;margin:0 24px 12px;padding:12px 18px;border-radius:12px;background:#0c4a6e;font-size:24px}
+main{display:grid;grid-template-columns:360px 1fr 440px;gap:16px;padding:0 24px 24px}
+@media(max-width:1300px){main{grid-template-columns:1fr}}
+.card{background:var(--card);border-radius:16px;padding:16px}
+.tank{position:relative;width:220px;height:300px;margin:8px auto;border:6px solid #5b6b8c;border-radius:14px;overflow:hidden;background:#0a1020}
+#water{position:absolute;left:0;bottom:0;width:100%;height:0;background:linear-gradient(#38bdf8,#0369a1);transition:height .8s}
+.pct{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:76px;font-weight:800;text-shadow:0 2px 8px #000}
+#litres{text-align:center;font-size:44px;font-weight:700}
+.badges{display:flex;gap:10px;justify-content:center;margin:10px 0;flex-wrap:wrap}
+.badge{padding:10px 20px;border-radius:12px;font-weight:800;font-size:30px;background:#334155}
+.badge.on{background:#15803d}.badge.trip{background:#b91c1c}
+#quiet{width:100%;margin-top:12px;padding:20px;font-size:34px;font-weight:800;border:0;border-radius:14px;cursor:pointer;background:#334155;color:#fff}
+#quiet.on{background:#7c3aed}
+.chartbox{position:relative;height:300px}
+#feed{max-height:calc(100vh - 190px);overflow:auto}
+.ev{border-left:10px solid var(--info);background:#0f172a;border-radius:10px;padding:10px 14px;margin-bottom:10px}
+.ev.warning{border-color:var(--warn)}.ev.critical{border-color:var(--crit)}
+.ev b{font-size:26px}.ev small{display:block;color:var(--mut);font-size:20px}.ev .x{color:#fde68a;font-weight:700}
+#cdn{display:none;margin:0 24px 12px;padding:10px 16px;background:#7f1d1d;border-radius:10px}
+</style></head><body>
+<header><h1>&#128167; TankWatch</h1>
+  <div class="chips"><span id="cEdge" class="chip">Edge: ...</span><span id="cGw" class="chip">Gateway: ...</span><span id="cCloud" class="chip">Cloud: ...</span></div></header>
+<div id="note">Edge works offline: the Uno keeps cycling the pump with no laptop or internet. Cloud is only for visibility and alerts.</div>
+<div id="cdn">Chart.js did not load (CDN blocked). Download chart.umd.min.js next to dashboard.html and reload. Gauge and events still work.</div>
+<main>
+  <section class="card">
+    <h2>Tank level</h2>
+    <div class="tank"><div id="water"></div><div class="pct"><span id="pct">--</span>%</div></div>
+    <div id="litres">-- L</div>
+    <div class="badges"><span id="pump" class="badge">PUMP --</span><span id="st" class="badge">--</span></div>
+    <button id="quiet">NOBODY HOME: OFF</button>
+  </section>
+  <section style="display:grid;gap:16px;align-content:start">
+    <div class="card"><h2>Level (last 10 min) - blue = pump on</h2><div class="chartbox"><canvas id="lc"></canvas></div></div>
+    <div class="card"><h2>Fill time per cycle (s) - line = baseline</h2><div class="chartbox"><canvas id="bc"></canvas></div></div>
+  </section>
+  <section class="card"><h2>Events</h2><div id="feed"></div></section>
+</main>
+<script src="chart.umd.min.js"
+  onerror="this.onerror=null;var s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js';document.head.appendChild(s)"></script>
+<script>
+// API base: same origin by default; use ?api=https://host to point elsewhere. ?key=XXX stores the API key (needed for the toggle).
+const qs=new URLSearchParams(location.search);
+const API=(qs.get('api')||'').replace(/\/$/,'');
+if(qs.get('key'))localStorage.setItem('tw_key',qs.get('key'));
+const KEY=localStorage.getItem('tw_key')||'';
+const $=id=>document.getElementById(id);
+const WIN=600, DRIFT_RATIO=1.25;
+let started=false,off=0,lastTs=0,rows=[],cloudOk=false,quiet=false,lc,bc,spans=[];
+const EXPL={
+ DRAWDOWN:'Level is falling while the pump is off and nobody is using water: possible leak, stuck float valve or unauthorised use.',
+ FILL_DRIFT:'The tank is taking longer to fill than normal: possible foot-valve wear, air lock or pump degradation.',
+ PUMP_FLAT_SUPPLY:'Pump is running, level is not rising, sensor readings are valid: the water supply has failed.',
+ PUMP_FLAT_SENSOR:'Pump is running but the level sensor is timing out or stuck: sensor fault, level cannot be trusted.',
+ FAILSAFE_TRIP:'The edge controller stopped the pump at its maximum run time. Find the cause, then reset the trip.',
+ RECOVERED:'Conditions are back to normal.'};
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const hhmmss=ms=>new Date(ms).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+
+async function j(u,o){const c=new AbortController(),t=setTimeout(()=>c.abort(),4000);
+  try{const r=await fetch(API+u,{...o,signal:c.signal});if(!r.ok)throw new Error(r.status);return await r.json()}finally{clearTimeout(t)}}
+
+function start(){ if(started)return; started=true;
+  if(typeof Chart==='undefined'){$('cdn').style.display='block'}
+  else{
+    Chart.defaults.color='#cbd5e1';Chart.defaults.font.size=18;Chart.defaults.animation=false;
+    const shade={id:'shade',beforeDatasetsDraw(c){const a=c.chartArea,x=c.scales.x,g=c.ctx;g.save();g.fillStyle='rgba(56,189,248,.22)';
+      for(const s of spans){const x0=Math.max(x.getPixelForValue(s[0]),a.left),x1=Math.min(x.getPixelForValue(s[1]),a.right);if(x1>x0)g.fillRect(x0,a.top,x1-x0,a.bottom-a.top)}g.restore()}};
+    lc=new Chart($('lc'),{type:'line',plugins:[shade],data:{datasets:[{data:[],borderColor:'#7dd3fc',borderWidth:4,pointRadius:0,tension:.2}]},
+      options:{maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{min:0,max:100,title:{display:true,text:'level %'}},
+      x:{type:'linear',ticks:{maxTicksLimit:6,callback:v=>hhmmss(v)}}}}});
+    bc=new Chart($('bc'),{data:{labels:[],datasets:[{type:'bar',data:[],backgroundColor:[]},
+      {type:'line',data:[],borderColor:'#fbbf24',borderWidth:4,borderDash:[8,6],pointRadius:0}]},
+      options:{maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{beginAtZero:true,title:{display:true,text:'seconds'}}}}});
+  }
+  tick();
+}
+
+function chip(id,txt,cls){const e=$(id);e.textContent=txt;e.className='chip '+cls}
+
+function render(s){
+  const L=s.latest, gw=s.gateway_age_s!=null&&s.gateway_age_s<5;
+  if(L){
+    $('pct').textContent=Math.round(L.level_pct);$('water').style.height=L.level_pct+'%';
+    $('litres').textContent=L.level_l.toFixed(1)+' L';
+    $('pump').textContent='PUMP '+(L.pump?'ON':'OFF');$('pump').className='badge'+(L.pump?' on':'');
+    $('st').textContent=L.state;$('st').className='badge'+(L.state==='TRIP'?' trip':'');  }else{ // nothing stored (fresh start or after a reset): blank the gauge and old chart points
+    $('pct').textContent='--';$('water').style.height='0%';$('litres').textContent='-- L';
+    $('pump').textContent='PUMP --';$('pump').className='badge';$('st').textContent='--';$('st').className='badge';rows=[];
+  }
+  chip('cGw','Gateway: '+(gw?'online':'offline'),gw?'ok':'bad');
+  if(!L)chip('cEdge','Edge: no data yet','warn');
+  else if(gw)chip('cEdge',L.state==='TRIP'?'Edge: TRIPPED':'Edge: running',L.state==='TRIP'?'bad':'ok');
+  else chip('cEdge','Edge: unknown (last seen '+hhmmss(L.ts*1000)+')','warn');
+  $('note').style.display=(!gw&&s.pump_active_recent)?'block':'none';
+  quiet=s.quiet_mode;btn();
+  // events
+  $('feed').innerHTML=s.events.map(e=>{const d=e.data||{},x=[];
+    if(d.loss_l_per_h!=null)x.push('Estimated loss: '+d.loss_l_per_h+' L/h');
+    if(d.pct_slower!=null)x.push(d.pct_slower+'% slower than baseline');
+    return `<div class="ev ${esc(e.severity)}"><b>${esc(e.type.replace(/_/g,' '))}</b> <small>${hhmmss(e.ts*1000)} - ${esc(e.severity)}</small>
+      ${x.length?`<div class="x">${esc(x.join(' | '))}</div>`:''}<div>${esc(EXPL[e.type]||'')}</div>${e.message?`<small>${esc(e.message)}</small>`:''}</div>`}).join('')
+    ||'<small>No events yet.</small>';
+  // fill cycles
+  if(bc){const c=s.cycles,b=s.baseline_s;
+    bc.data.labels=c.map((_,i)=>'#'+(i+1));bc.data.datasets[0].data=c.map(r=>+r.dur_s.toFixed(1));
+    bc.data.datasets[0].backgroundColor=c.map(r=>!b?'#38bdf8':r.dur_s>b*DRIFT_RATIO*1.2?'#ef4444':r.dur_s>b*DRIFT_RATIO?'#f59e0b':'#22c55e');
+    bc.data.datasets[1].data=c.map(()=>b||null);bc.update()}
+}
+function btn(){const b=$('quiet');b.textContent='NOBODY HOME: '+(quiet?'ON':'OFF');b.className=quiet?'on':''}
+$('quiet').onclick=async()=>{try{const r=await j('/api/control',{method:'POST',headers:{'Content-Type':'application/json','X-API-Key':KEY},body:JSON.stringify({quiet_mode:!quiet})});quiet=r.quiet_mode;btn()}
+  catch(e){alert('Toggle failed. Open the page once with ?key=YOUR_API_KEY')}};
+
+async function tick(){
+  try{
+    const s=await j('/api/state');off=s.server_ts*1000-Date.now();cloudOk=true;
+    chip('cCloud','Cloud: ok','ok');render(s);
+    if(!lastTs)lastTs=s.server_ts-WIN;
+    const r=await j('/api/readings?since='+lastTs);
+    if(r.length){rows.push(...r);lastTs=r[r.length-1].ts}
+    const now=(Date.now()+off)/1000;rows=rows.filter(p=>p.ts>now-WIN-30);
+    spans=[];let st=null;for(const p of rows){if(p.pump&&st===null)st=p.ts;if(!p.pump&&st!==null){spans.push([st*1000,p.ts*1000]);st=null}}
+    if(st!==null)spans.push([st*1000,now*1000]);
+    if(lc){lc.data.datasets[0].data=rows.map(p=>({x:p.ts*1000,y:p.level_pct}));
+      lc.options.scales.x.min=(now-WIN)*1000;lc.options.scales.x.max=now*1000;lc.update()}
+  }catch(e){cloudOk=false;chip('cCloud','Cloud: unreachable (retrying)','bad')}
+  setTimeout(tick,1000);
+}
+// start once the page and any Chart.js script (local or CDN) have finished loading
+if(document.readyState==='complete')start();else window.addEventListener('load',start);
+</script></body></html>
